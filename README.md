@@ -9,6 +9,10 @@ Velero 是一套開源的 Kubernetes 備份與復原工具，本專案在 Ubuntu
 - [Kubernetes 基礎架構](#kubernetes-基礎架構)
 - [為什麼需要 K8s 備份](#為什麼需要-k8s-備份)
 - [Velero 架構與運作原理](#velero-架構與運作原理)
+- [Velero 深入解析](#velero-深入解析)
+- [Velero 核心優勢](#velero-核心優勢)
+- [MinIO 核心優勢](#minio-核心優勢)
+- [Velero + MinIO 組合效益](#velero--minio-組合效益)
 - [PoC 架構](#poc-架構)
 - [技術元件版本](#技術元件版本)
 - [快速開始](#快速開始)
@@ -325,6 +329,656 @@ graph TB
     style L2 fill:#e3f2fd
     style L3 fill:#e0f7fa
     style L4 fill:#e8f5e9
+```
+
+---
+
+## Velero 深入解析
+
+### 歷史與發展
+
+Velero（拉丁語意為「航行」）最初由 Heptio 公司於 2017 年以 **Heptio Ark** 之名開源發布。2019 年 VMware 收購 Heptio 後，專案更名為 Velero 並持續積極維護。2023 年 Broadcom 收購 VMware 後，Velero 仍維持開源社群運作。Velero 採用 Apache 2.0 授權，是目前 Kubernetes 生態系中最廣泛使用的開源備份方案。
+
+**發展里程碑**：
+
+| 時間 | 事件 |
+|------|------|
+| 2017 | Heptio Ark v0.x 發布，支援基本備份/復原 |
+| 2019 | 更名為 Velero，VMware 接手維護 |
+| 2020 | v1.4 引入 CSI Snapshot 支援 |
+| 2021 | v1.7 改進排程備份與 Hook 機制 |
+| 2022 | v1.10 引入 Kopia 作為 Restic 替代方案 |
+| 2023 | v1.12 Kopia 成為預設上傳器，強化 Data Mover |
+| 2024 | v1.15+ 改進 CSI Snapshot Data Movement |
+| 2025 | v1.17 穩定版，本 PoC 使用版本 |
+
+### 核心自訂資源（Custom Resources / CRDs）
+
+Velero 在 Kubernetes 叢集中註冊多個 CRD，透過 Custom Resource 驅動所有操作。每項備份或復原都是一個 CR 物件，可透過 `kubectl` 或 Velero CLI 管理。
+
+```mermaid
+graph TB
+    subgraph CRDs["Velero Custom Resource Definitions"]
+        subgraph CORE["核心操作 CRDs"]
+            BK["Backup<br/>定義一次備份操作<br/>包含範圍、篩選條件、Hook"]
+            RS["Restore<br/>定義一次復原操作<br/>包含來源備份、映射規則"]
+            SC["Schedule<br/>定義排程備份<br/>Cron 表達式 + 模板"]
+        end
+
+        subgraph STORAGE["儲存位置 CRDs"]
+            BSL["BackupStorageLocation<br/>指向 S3/GCS/Azure Blob<br/>儲存備份 tarball 的位置"]
+            VSL["VolumeSnapshotLocation<br/>指向雲端快照 API<br/>管理 Volume Snapshot"]
+        end
+
+        subgraph DATA["資料移動 CRDs"]
+            PVB["PodVolumeBackup<br/>追蹤單一 Pod Volume<br/>的檔案備份進度"]
+            PVR["PodVolumeRestore<br/>追蹤單一 Pod Volume<br/>的檔案復原進度"]
+            DU["DataUpload<br/>CSI Snapshot 資料<br/>上傳至物件儲存"]
+            DD["DataDownload<br/>從物件儲存下載<br/>CSI Snapshot 資料"]
+        end
+
+        subgraph INTERNAL["內部管理 CRDs"]
+            DBC["DeleteBackupRequest<br/>請求刪除備份"]
+            DBKP["DownloadRequest<br/>請求下載備份內容"]
+            SBR["ServerStatusRequest<br/>查詢 Velero Server 狀態"]
+        end
+    end
+
+    style CORE fill:#e3f2fd
+    style STORAGE fill:#e8f5e9
+    style DATA fill:#fff3e0
+    style INTERNAL fill:#f3e5f5
+```
+
+#### 各 CRD 詳細說明
+
+**Backup CR** — 備份的核心定義
+
+```yaml
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: example-backup
+  namespace: velero
+spec:
+  # 範圍控制
+  includedNamespaces: ["demo-app", "demo-db"]   # 包含的 Namespace
+  excludedNamespaces: ["kube-system"]            # 排除的 Namespace
+  includedResources: ["*"]                       # 包含的資源類型
+  excludedResources: ["events"]                  # 排除的資源類型
+  includeClusterResources: true                  # 是否包含叢集層級資源
+  labelSelector:                                 # Label 篩選
+    matchLabels:
+      app: nginx
+
+  # Volume 備份
+  defaultVolumesToFsBackup: true                 # 預設使用檔案系統備份
+  snapshotMoveData: false                        # 是否啟用 CSI Snapshot Data Movement
+
+  # 生命週期
+  ttl: 720h0m0s                                  # 備份保留時間（30 天）
+  storageLocation: default                       # 使用的 BSL
+  volumeSnapshotLocations: ["default"]           # 使用的 VSL
+
+  # Hook
+  hooks:
+    resources:
+      - name: my-hook
+        includedNamespaces: ["demo-db"]
+        pre: [...]
+        post: [...]
+status:
+  phase: Completed                               # 狀態：New → InProgress → Completed/Failed
+  expiration: "2026-03-12T00:00:00Z"
+  progress:
+    itemsBackedUp: 42
+    totalItems: 42
+```
+
+**BackupStorageLocation (BSL)** — 備份儲存目的地
+
+```yaml
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: aws                                  # 儲存 Provider（aws/azure/gcp）
+  objectStorage:
+    bucket: velero-backup                        # S3 Bucket 名稱
+    prefix: ""                                   # 物件路徑前綴
+  config:
+    region: minio                                # S3 Region
+    s3ForcePathStyle: "true"                     # MinIO 必須使用 Path Style
+    s3Url: http://minio.minio.svc:9000           # S3 端點 URL
+  credential:
+    name: cloud-credentials                      # 引用的 Secret 名稱
+    key: cloud                                   # Secret 中的 Key
+  accessMode: ReadWrite                          # ReadWrite 或 ReadOnly
+  backupSyncPeriod: 1m                           # 備份同步週期
+  validationFrequency: 1m                        # BSL 健康檢查頻率
+```
+
+**Schedule CR** — 排程備份定義
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-backup
+  namespace: velero
+spec:
+  schedule: "0 2 * * *"                          # Cron 表達式（每日凌晨 2 點）
+  useOwnerReferencesInBackup: false
+  template:                                      # 內嵌 Backup Spec
+    includedNamespaces: ["demo-app", "demo-db"]
+    defaultVolumesToFsBackup: true
+    ttl: 168h0m0s                                # 7 天保留
+    storageLocation: default
+```
+
+### 資料保護機制
+
+Velero 提供三種 Volume 資料保護方式，各有不同的適用場景：
+
+```mermaid
+graph TB
+    subgraph METHODS["Velero 資料保護方式"]
+        subgraph FSB["File System Backup (FSB)"]
+            KOPIA["Kopia（v1.12+ 預設）<br/>• 增量備份 + 去重複<br/>• 內建壓縮 + 加密<br/>• 效能優於 Restic"]
+            RESTIC["Restic（舊版預設）<br/>• 增量備份 + 去重複<br/>• 跨平台支援良好<br/>• 已逐步被 Kopia 取代"]
+        end
+
+        subgraph CSI["CSI Snapshot"]
+            SNAP["Volume Snapshot<br/>• 透過 CSI Driver<br/>• 區塊層級快照<br/>• 速度最快"]
+            DM["Data Movement<br/>• Snapshot → 物件儲存<br/>• 跨叢集可攜<br/>• v1.12+ 新功能"]
+        end
+    end
+
+    FSB -->|"適合"| USE1["不支援 CSI Snapshot<br/>的儲存環境"]
+    CSI -->|"適合"| USE2["支援 CSI Snapshot<br/>的雲端環境"]
+    KOPIA -->|"Node Agent<br/>DaemonSet"| AGENT["在每個 Node 執行<br/>直接存取 PV 資料"]
+
+    style FSB fill:#e3f2fd
+    style CSI fill:#e8f5e9
+```
+
+#### Kopia vs Restic 比較
+
+| 特性 | Kopia（推薦） | Restic |
+|------|--------------|--------|
+| 增量備份 | 區塊層級 dedup | 區塊層級 dedup |
+| 壓縮 | 支援（zstd, s2 等） | 不支援 |
+| 加密 | 內建 AES-256-GCM | 內建 AES-256 |
+| 並行處理 | 多執行緒上傳/下載 | 單執行緒 |
+| 效能 | 較快（2-5x） | 較慢 |
+| 記憶體使用 | 較低 | 較高 |
+| Velero 狀態 | v1.12+ 預設推薦 | 維護模式 |
+
+#### 檔案系統備份運作流程
+
+```mermaid
+sequenceDiagram
+    participant VS as Velero Server
+    participant API as K8s API
+    participant NA as Node Agent (Kopia)
+    participant PV as PersistentVolume
+    participant S3 as MinIO (S3)
+
+    VS->>API: 建立 PodVolumeBackup CR
+    API->>NA: Watch 到新 PVB 資源
+
+    rect rgb(230, 245, 255)
+        Note over NA,PV: Phase 1: 掛載並讀取 PV
+        NA->>PV: 透過 hostPath 存取 PV 資料
+        NA->>NA: Kopia 分割為區塊 + 去重複
+    end
+
+    rect rgb(255, 243, 224)
+        Note over NA,S3: Phase 2: 上傳至物件儲存
+        NA->>NA: 壓縮 + 加密區塊
+        NA->>S3: 並行上傳新/修改的區塊
+        Note over S3: 僅上傳有變更的區塊<br/>大幅減少傳輸量
+    end
+
+    NA->>API: 更新 PVB 狀態 = Completed
+    API->>VS: 通知備份完成
+```
+
+### Plugin 架構
+
+Velero 採用 Go Plugin 機制，透過 gRPC 介面與插件溝通。每個 Plugin 以 sidecar 容器的形式執行在 Velero Deployment 中。
+
+```mermaid
+graph TB
+    subgraph VELERO["Velero Server Pod"]
+        CORE2["Velero Core<br/>（主容器）"]
+        subgraph PLUGINS["Plugin Containers（Init Containers）"]
+            P1["velero-plugin-for-aws<br/>S3 / EBS"]
+            P2["velero-plugin-for-gcp<br/>GCS / GCE Disk"]
+            P3["velero-plugin-for-azure<br/>Azure Blob / Managed Disk"]
+            P4["velero-plugin-for-csi<br/>CSI Snapshot"]
+        end
+    end
+
+    CORE2 -->|"gRPC"| P1
+    CORE2 -->|"gRPC"| P2
+    CORE2 -->|"gRPC"| P3
+    CORE2 -->|"gRPC"| P4
+
+    style PLUGINS fill:#e8eaf6
+```
+
+#### Plugin 類型
+
+| Plugin 介面 | 用途 | 範例 |
+|-------------|------|------|
+| **ObjectStore** | 讀寫物件儲存 | AWS S3, GCS, Azure Blob, MinIO |
+| **VolumeSnapshotter** | 管理 Volume 快照 | AWS EBS, GCE PD, Azure Disk |
+| **BackupItemAction** | 備份時對個別資源執行自訂動作 | 修改 Resource YAML, 觸發快照 |
+| **RestoreItemAction** | 復原時對個別資源執行自訂動作 | 修改還原的 YAML, 重設 Service IP |
+| **DeleteItemAction** | 刪除備份時執行自訂清理 | 刪除雲端快照 |
+
+> **本 PoC 使用**：`velero-plugin-for-aws:v1.11.0` — 透過 ObjectStore 介面與 MinIO S3 API 互通。
+
+### 資源篩選機制詳解
+
+Velero 提供多層篩選機制，可精確控制備份與復原的範圍：
+
+```mermaid
+graph TB
+    subgraph FILTER["資源篩選層次（由寬到窄）"]
+        F1["1. Namespace 篩選<br/>--include-namespaces / --exclude-namespaces"]
+        F2["2. Resource Type 篩選<br/>--include-resources / --exclude-resources"]
+        F3["3. Label Selector 篩選<br/>--selector app=nginx"]
+        F4["4. Cluster Resource 控制<br/>--include-cluster-resources=true/false"]
+        F5["5. 個別資源排除<br/>velero.io/exclude-from-backup=true label"]
+    end
+
+    F1 --> F2 --> F3 --> F4 --> F5
+
+    style F1 fill:#e8eaf6
+    style F2 fill:#e3f2fd
+    style F3 fill:#e0f7fa
+    style F4 fill:#e8f5e9
+    style F5 fill:#fff3e0
+```
+
+#### 個別資源排除
+
+在特定資源上加上 label 即可將其排除在備份之外：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporary-config
+  labels:
+    velero.io/exclude-from-backup: "true"   # Velero 會自動跳過此資源
+```
+
+#### 復原時的篩選
+
+復原時可進一步篩選要還原的資源子集：
+
+```bash
+velero restore create my-restore \
+  --from-backup full-backup-01 \
+  --include-namespaces demo-app \           # 僅還原 demo-app namespace
+  --include-resources configmaps,secrets \  # 僅還原 ConfigMap 與 Secret
+  --selector tier=frontend \                # 僅還原符合 label 的資源
+  --namespace-mappings demo-app:demo-app-v2 # 還原到不同 Namespace
+```
+
+### Hook 機制詳解
+
+Hook 是 Velero 實現應用程式一致性備份的關鍵機制。透過在備份/復原的特定時間點執行自訂指令，確保資料狀態的一致性。
+
+#### Backup Hook（備份掛鉤）
+
+```mermaid
+graph TB
+    subgraph BHOOK["Backup Hook 設定方式"]
+        subgraph ANNO["方式一：Pod Annotation（本 PoC 使用）"]
+            A1["pre.hook.backup.velero.io/command"]
+            A2["pre.hook.backup.velero.io/container"]
+            A3["pre.hook.backup.velero.io/timeout"]
+            A4["pre.hook.backup.velero.io/on-error"]
+            A5["post.hook.backup.velero.io/command"]
+        end
+
+        subgraph SPEC["方式二：Backup Spec"]
+            S1["spec.hooks.resources[].pre"]
+            S2["spec.hooks.resources[].post"]
+            S3["支援 labelSelector 篩選"]
+        end
+    end
+
+    style ANNO fill:#e3f2fd
+    style SPEC fill:#e8f5e9
+```
+
+**方式一：Pod Annotation（推薦用於持續性設定）**
+
+```yaml
+# 直接在 Pod Template 中設定，每次備份自動生效
+metadata:
+  annotations:
+    # Pre-backup：備份前執行（例如鎖定資料庫）
+    pre.hook.backup.velero.io/command: '["/bin/bash", "-c", "mysqldump ..."]'
+    pre.hook.backup.velero.io/container: mysql       # 指定容器（可選）
+    pre.hook.backup.velero.io/timeout: "30s"          # 逾時時間
+    pre.hook.backup.velero.io/on-error: Fail          # Fail 或 Continue
+
+    # Post-backup：備份後執行（例如解鎖資料庫）
+    post.hook.backup.velero.io/command: '["/bin/bash", "-c", "UNLOCK TABLES"]'
+    post.hook.backup.velero.io/timeout: "10s"
+```
+
+**方式二：Backup Spec（推薦用於一次性設定）**
+
+```yaml
+apiVersion: velero.io/v1
+kind: Backup
+spec:
+  hooks:
+    resources:
+      - name: mysql-lock
+        includedNamespaces: ["demo-db"]
+        labelSelector:
+          matchLabels:
+            app: mysql
+        pre:
+          - exec:
+              command: ["/bin/bash", "-c", "FLUSH TABLES WITH READ LOCK"]
+              timeout: 30s
+              onError: Fail
+        post:
+          - exec:
+              command: ["/bin/bash", "-c", "UNLOCK TABLES"]
+              timeout: 10s
+```
+
+#### Restore Hook（復原掛鉤）
+
+Restore Hook 透過注入 `initContainer` 的方式，在 Pod 啟動前執行復原後驗證或初始化。
+
+```mermaid
+sequenceDiagram
+    participant VS as Velero Server
+    participant API as K8s API
+    participant Pod as 還原的 Pod
+
+    VS->>API: 建立 Pod（注入 initContainer）
+
+    rect rgb(243, 229, 245)
+        Note over Pod: initContainer 執行
+        Pod->>Pod: 執行復原後驗證腳本
+        Pod->>Pod: 檢查資料完整性
+        Pod->>Pod: 執行資料遷移/修復
+    end
+
+    Note over Pod: initContainer 完成後<br/>主容器才啟動
+    Pod->>Pod: 主容器正常啟動
+```
+
+#### 常見 Hook 應用場景
+
+| 資料庫 | Pre-backup Hook | Post-backup Hook |
+|--------|----------------|-----------------|
+| **MySQL** | `FLUSH TABLES WITH READ LOCK` | `UNLOCK TABLES` |
+| **PostgreSQL** | `pg_start_backup('velero')` | `pg_stop_backup()` |
+| **MongoDB** | `db.fsyncLock()` | `db.fsyncUnlock()` |
+| **Redis** | `BGSAVE` | — |
+| **Elasticsearch** | `_flush/synced` | — |
+
+### 安全性與加密
+
+```mermaid
+graph TB
+    subgraph SECURITY["Velero 安全層次"]
+        subgraph TRANSIT["傳輸加密"]
+            TLS["TLS 加密<br/>Velero ↔ S3 通訊<br/>建議啟用 HTTPS"]
+        end
+
+        subgraph REST["靜態加密"]
+            SSE["Server-Side Encryption<br/>MinIO SSE-S3 / SSE-KMS<br/>儲存端自動加密"]
+            KENC["Kopia 內建加密<br/>AES-256-GCM<br/>備份資料端加密"]
+        end
+
+        subgraph ACCESS["存取控制"]
+            RBAC2["K8s RBAC<br/>控制誰能執行備份/復原"]
+            IAM["S3 IAM Policy<br/>控制 Bucket 存取權限"]
+            IMMUT["Immutable Bucket<br/>Object Lock<br/>防勒索軟體竄改"]
+        end
+    end
+
+    style TRANSIT fill:#e3f2fd
+    style REST fill:#fff3e0
+    style ACCESS fill:#e8f5e9
+```
+
+---
+
+## Velero 核心優勢
+
+### 對比傳統備份方案
+
+| 面向 | 傳統 VM 備份 | etcd Snapshot | **Velero** |
+|------|-------------|---------------|-----------|
+| 備份粒度 | 整台 VM | 整個 etcd | Namespace / Label / Resource Type |
+| 選擇性復原 | 不支援 | 不支援 | 支援任意組合 |
+| 跨叢集遷移 | 困難 | 困難 | 原生支援 |
+| 應用一致性 | 無 | 無 | Hook 機制 |
+| Volume 資料 | 仰賴快照 | 不備份 | FSB + CSI Snapshot |
+| 排程備份 | 需外部工具 | 需外部工具 | 內建 Schedule CRD |
+| 成本 | 商業授權 | 免費但功能有限 | 免費開源（Apache 2.0） |
+
+### 十大核心優勢
+
+**1. 完全開源且無授權限制**
+- Apache 2.0 授權，可自由用於商業環境
+- 無節點數量限制、無備份容量限制
+- 社群活躍，GitHub 8000+ Stars，持續迭代更新
+
+**2. Kubernetes 原生設計**
+- 所有操作透過 CRD 驅動，完全融入 K8s 生態
+- 可透過 `kubectl` 管理所有備份資源
+- 支援 GitOps 工作流程（Backup/Schedule 可納入版本控制）
+
+**3. 精細化備份粒度**
+- 支援全叢集、Namespace、Label、Resource Type 多種粒度
+- 可精確排除不需要的資源，減少備份大小與時間
+- 支援叢集層級資源（ClusterRole、CRD 等）備份
+
+**4. 高效的增量備份**
+- Kopia 引擎支援區塊層級去重複（Deduplication）
+- 僅上傳變更的資料區塊，大幅減少網路傳輸與儲存空間
+- 內建壓縮進一步降低儲存成本
+
+**5. 應用程式一致性保證**
+- Pre/Post Backup Hook 確保資料庫等有狀態應用的一致性
+- 支援 Pod Annotation 和 Backup Spec 兩種 Hook 設定方式
+- 可配置 Hook 失敗時的行為（Fail 或 Continue）
+
+**6. 靈活的復原選項**
+- 支援完整復原、選擇性復原、跨 Namespace 復原
+- Namespace Mapping 實現跨叢集遷移
+- `--existing-resource-policy=update` 支援就地更新
+- Restore Hook 支援復原後自動驗證
+
+**7. 多雲端與混合雲支援**
+- 官方 Plugin 支援 AWS、Azure、GCP
+- S3 相容協定支援 MinIO、Ceph、NetApp StorageGRID 等
+- 可在不同雲端之間遷移工作負載
+
+**8. 自動化生命週期管理**
+- 內建 Schedule CRD 支援 Cron 排程
+- TTL 機制自動清理過期備份，避免儲存空間膨脹
+- Garbage Collection 自動回收孤立資源
+
+**9. 可擴展的 Plugin 架構**
+- gRPC 介面允許開發自訂 Plugin
+- BackupItemAction / RestoreItemAction 可對特定資源做自訂處理
+- 社群提供豐富的第三方 Plugin
+
+**10. 企業級災難復原能力**
+- 支援多個 BackupStorageLocation 實現 3-2-1 策略
+- ReadOnly BSL 防止備份被意外修改
+- 跨地域複寫確保區域性災難的復原能力
+
+---
+
+## MinIO 核心優勢
+
+### MinIO 簡介
+
+MinIO 是一套高效能、S3 API 相容的開源物件儲存系統。它可以部署在任何基礎架構上（裸機、VM、Kubernetes、邊緣節點），是 Velero 在非公有雲環境中最理想的備份目的地。
+
+```mermaid
+graph TB
+    subgraph MINIO_ARCH["MinIO 架構"]
+        subgraph FEATURES["核心能力"]
+            PERF["高效能<br/>讀寫速度可達<br/>數百 GB/s"]
+            S3API["100% S3 API 相容<br/>無需修改即可對接<br/>任何 S3 工具"]
+            SCALE["水平擴展<br/>分散式架構<br/>支援 PB 級儲存"]
+            SEC3["安全性<br/>加密、IAM、<br/>版本控制、Object Lock"]
+        end
+
+        subgraph DEPLOY["部署彈性"]
+            SINGLE["單節點模式<br/>開發/測試"]
+            DIST["分散式模式<br/>多節點高可用"]
+            K8SMODE["Kubernetes Operator<br/>雲原生部署"]
+        end
+    end
+
+    style FEATURES fill:#e8f5e9
+    style DEPLOY fill:#e3f2fd
+```
+
+### 十大核心優勢
+
+**1. 完整的 S3 API 相容性**
+- 100% 相容 AWS S3 API，包括 Multipart Upload、Versioning、Lifecycle Policy
+- 任何支援 S3 的工具（Velero、Terraform、Spark 等）皆可直接使用
+- 從 AWS S3 遷移到 MinIO 無需修改應用程式碼
+
+**2. 卓越的效能表現**
+- 在標準硬體上可達到 325 GiB/s 讀取、165 GiB/s 寫入
+- 專為大量小檔案與大檔案混合工作負載最佳化
+- 低延遲設計，適合即時備份場景
+
+**3. 開源且商業友善**
+- GNU AGPL v3 開源授權，社群版完全免費
+- 提供商業訂閱（含技術支援與進階功能）
+- 無隱藏費用，無資料傳輸費
+
+**4. 資料保護與冗餘**
+- Erasure Coding（糾刪碼）確保即使部分磁碟故障仍可讀取資料
+- Bitrot Protection 自動偵測並修復靜默資料損毀
+- 可配置的冗餘等級（EC:2 到 EC:8）
+
+**5. 企業級安全性**
+- Server-Side Encryption（SSE-S3 / SSE-KMS）靜態加密
+- 支援外部 KMS（HashiCorp Vault, AWS KMS, GCP KMS）
+- TLS 加密傳輸、IAM Policy 精細存取控制
+
+**6. 不可變備份（Immutability）**
+- Object Lock + WORM 模式防止備份被刪除或修改
+- 法規遵循模式（Compliance Mode）滿足金融/醫療法規要求
+- 有效防禦勒索軟體攻擊
+
+**7. 版本控制與生命週期管理**
+- Bucket Versioning 保留所有物件的歷史版本
+- Lifecycle Policy 自動刪除過期物件，控制儲存成本
+- 與 Velero TTL 機制搭配實現雙重過期管理
+
+**8. 原生 Kubernetes 整合**
+- 官方提供 MinIO Operator 與 Helm Chart
+- 支援 CSI Driver 作為 PV 後端
+- 輕量部署，單一 Pod 即可運作（如本 PoC）
+
+**9. 多站點複寫**
+- Bucket Replication 實現跨站點資料同步
+- 支援單向（Active-Passive）與雙向（Active-Active）複寫
+- 搭配 Velero Multi-BSL 建構完整的異地備援
+
+**10. 豐富的監控與管理**
+- 內建 Web Console（本 PoC 透過 port 9001 存取）
+- Prometheus Metrics 端點，可整合 Grafana 監控
+- 支援 Audit Log 與 Event Notification（Webhook, Kafka, AMQP）
+
+---
+
+## Velero + MinIO 組合效益
+
+### 為什麼 Velero 與 MinIO 是最佳搭檔
+
+```mermaid
+graph TB
+    subgraph SYNERGY["Velero + MinIO 協同效益"]
+        subgraph V_SIDE["Velero 提供"]
+            V1["K8s 原生備份引擎"]
+            V2["精細化備份粒度"]
+            V3["自動排程 + TTL"]
+            V4["應用一致性 Hook"]
+        end
+
+        subgraph M_SIDE["MinIO 提供"]
+            M1["S3 相容物件儲存"]
+            M2["資料加密 + 冗餘"]
+            M3["Immutable Backup"]
+            M4["多站點複寫"]
+        end
+
+        subgraph RESULT["組合效益"]
+            R1["零公有雲依賴<br/>完全在地部署"]
+            R2["端到端資料保護<br/>備份→加密→防竄改"]
+            R3["彈性擴展<br/>從 PoC 到 PB 級生產"]
+            R4["低總成本<br/>雙開源、無授權費"]
+        end
+    end
+
+    V_SIDE --> RESULT
+    M_SIDE --> RESULT
+
+    style V_SIDE fill:#e3f2fd
+    style M_SIDE fill:#e8f5e9
+    style RESULT fill:#fff3e0
+```
+
+### 組合優勢總結
+
+| 效益 | 說明 |
+|------|------|
+| **資料主權** | 所有備份資料儲存在組織自有基礎架構，不經過公有雲 |
+| **零 Egress 費用** | 不需支付雲端資料傳輸費，備份頻率不影響成本 |
+| **合規就緒** | MinIO Object Lock + Velero 排程 = 滿足資料保留法規 |
+| **災難復原** | MinIO 多站點複寫 + Velero Multi-BSL = 異地備援 |
+| **效能可控** | 備份目的地在本地網路，傳輸速度可預期 |
+| **從 PoC 到生產** | 同一套架構，只需擴展 MinIO 節點數即可應對生產規模 |
+| **技術支援** | 兩者皆有活躍社群與商業支援選項 |
+
+### 適用場景
+
+```mermaid
+graph LR
+    subgraph SCENARIOS["適用場景"]
+        S1["金融業<br/>資料不出境、法規遵循"]
+        S2["政府機關<br/>資料主權、安全等級"]
+        S3["醫療業<br/>HIPAA 合規、資料保護"]
+        S4["教育研究<br/>預算有限、自主管理"]
+        S5["企業內部<br/>混合雲、多叢集管理"]
+    end
+
+    S1 --> SOL["Velero + MinIO<br/>On-Premises 部署"]
+    S2 --> SOL
+    S3 --> SOL
+    S4 --> SOL
+    S5 --> SOL
+
+    style SOL fill:#c8e6c9
 ```
 
 ---
