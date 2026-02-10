@@ -22,6 +22,8 @@ Velero 是一套開源的 Kubernetes 備份與復原工具，本專案在 Ubuntu
 - [常見問題排查](#常見問題排查)
 - [企業評估摘要](#企業評估摘要)
 - [清理環境](#清理環境)
+- [專案檔案說明](#專案檔案說明)
+- [延伸學習資源](#延伸學習資源)
 
 ---
 
@@ -420,13 +422,19 @@ spec:
   storageLocation: default                       # 使用的 BSL
   volumeSnapshotLocations: ["default"]           # 使用的 VSL
 
-  # Hook
+  # Hook（詳見「Hook 機制詳解」章節）
   hooks:
     resources:
       - name: my-hook
         includedNamespaces: ["demo-db"]
-        pre: [...]
-        post: [...]
+        pre:
+          - exec:
+              command: ["/bin/bash", "-c", "FLUSH TABLES WITH READ LOCK"]
+              timeout: 30s
+        post:
+          - exec:
+              command: ["/bin/bash", "-c", "UNLOCK TABLES"]
+              timeout: 10s
 status:
   phase: Completed                               # 狀態：New → InProgress → Completed/Failed
   expiration: "2026-03-12T00:00:00Z"
@@ -623,12 +631,13 @@ metadata:
 復原時可進一步篩選要還原的資源子集：
 
 ```bash
+# 僅還原 demo-app namespace 中符合 label 的 ConfigMap 與 Secret，並還原到不同 Namespace
 velero restore create my-restore \
   --from-backup full-backup-01 \
-  --include-namespaces demo-app \           # 僅還原 demo-app namespace
-  --include-resources configmaps,secrets \  # 僅還原 ConfigMap 與 Secret
-  --selector tier=frontend \                # 僅還原符合 label 的資源
-  --namespace-mappings demo-app:demo-app-v2 # 還原到不同 Namespace
+  --include-namespaces demo-app \
+  --include-resources configmaps,secrets \
+  --selector tier=frontend \
+  --namespace-mappings demo-app:demo-app-v2
 ```
 
 ### Hook 機制詳解
@@ -1593,15 +1602,13 @@ graph TB
     style ETCD fill:#f3e5f5
 ```
 
-### 優勢
+### 優勢與限制
 
-- 完全開源免費（Apache 2.0 授權），無節點數限制
-- 透過 Kubernetes API 備份（非直接存取 etcd），安全性更高
-- 支援 Kopia/Restic 檔案系統備份，不依賴 CSI Snapshot
-- Plugin 架構可擴充，支援 AWS / Azure / GCP 等主流雲端
-- 社群活躍，VMware/Broadcom 持續維護
+> 詳細的 Velero 與 MinIO 優勢分析請參閱 [Velero 核心優勢](#velero-核心優勢)、[MinIO 核心優勢](#minio-核心優勢)、[Velero + MinIO 組合效益](#velero--minio-組合效益) 章節。
 
-### 限制
+**主要優勢**：開源免費（Apache 2.0）、K8s 原生 CRD 設計、Kopia 增量備份、Plugin 可擴充、社群活躍
+
+**已知限制**：
 
 - 純 CLI 操作，無內建 Web UI（可搭配第三方 Dashboard）
 - 應用層一致性備份需自行實作 Hook
