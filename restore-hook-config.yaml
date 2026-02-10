@@ -1,0 +1,30 @@
+# restore-hook-config.yaml
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: restore-with-hook
+  namespace: velero
+spec:
+  backupName: db-backup-with-hook
+  includedNamespaces:
+    - demo-db
+  hooks:
+    resources:
+      - name: mysql-post-restore
+        includedNamespaces:
+          - demo-db
+        labelSelector:
+          matchLabels:
+            app: mysql
+        postHooks:
+          - init:
+              initContainers:
+                - name: post-restore-check
+                  image: mysql:8.0
+                  command:
+                    - /bin/bash
+                    - -c
+                    - |
+                      echo "Post-restore validation started"
+                      sleep 10
+                      echo "Post-restore validation completed"
